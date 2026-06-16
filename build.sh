@@ -11,6 +11,8 @@ KERNELSU_VARIANT="${KERNELSU_VARIANT:-ksu}"
 SUSFS_ENABLED="${SUSFS_ENABLED:-true}"
 PATCHES_REPO="${PATCHES_REPO:-JackA1ltman/NonGKI_Kernel_Patches}"
 PATCHES_BRANCH="${PATCHES_BRANCH:-op_kernel}"
+SUSFS_BRANCH="${SUSFS_BRANCH:-kernel-4.19}"
+ALLOW_EXPERIMENTAL_SUSFS_VARIANT="${ALLOW_EXPERIMENTAL_SUSFS_VARIANT:-false}"
 
 # Colors
 RED='\033[0;31m'
@@ -108,51 +110,56 @@ apply_susfs() {
         return
     fi
 
+    if [ "$KERNELSU_VARIANT" != "ksu" ] && [ "$ALLOW_EXPERIMENTAL_SUSFS_VARIANT" != "true" ]; then
+        error "SUSFS_BRANCH=$SUSFS_BRANCH uses the old 4.19 KernelSU patch set. Use KERNELSU_VARIANT=ksu, or port matching SuSFS v2 kernel-side patches for $KERNELSU_VARIANT. Set ALLOW_EXPERIMENTAL_SUSFS_VARIANT=true only if you know this patch set matches."
+    fi
+
     log "Applying SUSFS patches..."
     cd kernel_source
 
     # Find KernelSU directory
     KSU_DIR=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -1)
+    [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ] || error "KernelSU directory not found after setup_kernelsu"
     log "KernelSU directory: $KSU_DIR"
 
-    # Clone susfs4ksu for kernel patches (kernel-4.19 branch)
-    log "Cloning susfs4ksu (kernel-4.19 branch)..."
-    git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b kernel-4.19 susfs4ksu || \
-    git clone --depth=1 https://github.com/sidex15/susfs4ksu.git -b kernel-4.19 susfs4ksu
+    # Clone susfs4ksu for kernel patches (kernel-4.19 branch by default)
+    log "Cloning susfs4ksu ($SUSFS_BRANCH branch)..."
+    git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" susfs4ksu || \
+    git clone --depth=1 https://github.com/sidex15/susfs4ksu.git -b "$SUSFS_BRANCH" susfs4ksu
 
     # Step 1: Apply revert commit in KernelSU (as per official instructions)
     log "Step 1: Reverting kprobe commit in KernelSU..."
-    if [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ]; then
-        cd "$KSU_DIR"
-        git revert --no-commit 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 2>/dev/null || log "Revert may not be needed for this version"
-        cd ..
-    fi
+    cd "$KSU_DIR"
+    git revert --no-commit 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 2>/dev/null || log "Revert may not be needed for this version"
+    cd ..
 
     # Step 2: Disable kprobes in KernelSU (replace #ifdef CONFIG_KPROBES with #if defined(CONFIG_KPROBES) && 0)
     log "Step 2: Disabling kprobes in KernelSU..."
-    if [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ]; then
-        find "$KSU_DIR" -name "*.c" -o -name "*.h" | xargs sed -i 's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g' 2>/dev/null || true
-        find "$KSU_DIR" -name "*.c" -o -name "*.h" | xargs sed -i 's/#if defined(CONFIG_KPROBES)/#if defined(CONFIG_KPROBES) \&\& 0/g' 2>/dev/null || true
-    fi
+    find "$KSU_DIR" \( -name "*.c" -o -name "*.h" \) -print0 | \
+        xargs -0 sed -i 's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g'
+    find "$KSU_DIR" \( -name "*.c" -o -name "*.h" \) -print0 | \
+        xargs -0 sed -i 's/#if defined(CONFIG_KPROBES)/#if defined(CONFIG_KPROBES) \&\& 0/g'
 
     # Step 3: Copy SUSFS patch to KernelSU folder and apply
     log "Step 3: Copying and applying SUSFS KernelSU patch..."
     if [ -f "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
         cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DIR/"
         cd "$KSU_DIR"
-        patch -p1 < 10_enable_susfs_for_ksu.patch || log "KernelSU SUSFS patch may need adjustment"
+        patch -p1 < 10_enable_susfs_for_ksu.patch || error "Failed to apply KernelSU SUSFS patch"
         cd ..
+    else
+        error "Missing susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
     fi
 
     # Step 4: Copy SUSFS source files to kernel
     log "Step 4: Copying SUSFS source files..."
-    cp -v susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
-    cp -v susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+    cp -v susfs4ksu/kernel_patches/fs/* fs/ || error "Failed to copy SUSFS fs source files"
+    cp -v susfs4ksu/kernel_patches/include/linux/* include/linux/ || error "Failed to copy SUSFS include files"
 
     # Step 5: Copy and apply kernel SUSFS patch
     log "Step 5: Applying kernel SUSFS patch..."
-    cp susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch ./
-    patch -p1 < 50_add_susfs_in_kernel-4.19.patch || log "Kernel SUSFS patch may need manual adjustment"
+    cp susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch ./ || error "Missing 50_add_susfs_in_kernel-4.19.patch"
+    patch -p1 < 50_add_susfs_in_kernel-4.19.patch || error "Failed to apply kernel SUSFS patch"
 
     # Step 6: Apply device-specific fixes if available
     if [ -f "../patches/kona_cos15_a15/susfs_fixed.patch" ]; then
@@ -265,11 +272,13 @@ package_kernel() {
     # Copy DTBO if exists
     [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
 
-    # Configure anykernel.sh for OnePlus 8 series
+    # Configure anykernel.sh for OnePlus SM8250 family
     sed -i "s/do.devicecheck=.*/do.devicecheck=1/g" anykernel.sh
     sed -i "s/do.modules=.*/do.modules=0/g" anykernel.sh
     sed -i "s/device.name1=.*/device.name1=instantnoodle/g" anykernel.sh
     sed -i "s/device.name2=.*/device.name2=instantnoodlep/g" anykernel.sh
+    grep -q "^device.name3=" anykernel.sh && sed -i "s/device.name3=.*/device.name3=kebab/g" anykernel.sh || echo "device.name3=kebab" >> anykernel.sh
+    grep -q "^device.name4=" anykernel.sh && sed -i "s/device.name4=.*/device.name4=lemonades/g" anykernel.sh || echo "device.name4=lemonades" >> anykernel.sh
     sed -i "s|block=.*|block=/dev/block/bootdevice/by-name/boot;|g" anykernel.sh
     sed -i "s/is_slot_device=.*/is_slot_device=1;/g" anykernel.sh
 
