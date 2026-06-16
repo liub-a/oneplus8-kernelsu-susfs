@@ -8,6 +8,7 @@ KERNEL_BRANCH="${KERNEL_BRANCH:-lineage-23.0}"
 DEFCONFIG="${DEFCONFIG:-vendor/kona-perf_defconfig}"
 DEVICE_NAME="${DEVICE_NAME:-OnePlus8_Series}"
 KERNELSU_VARIANT="${KERNELSU_VARIANT:-ksu}"
+KERNELSU_REF="${KERNELSU_REF:-v0.9.5}"
 SUSFS_ENABLED="${SUSFS_ENABLED:-true}"
 PATCHES_REPO="${PATCHES_REPO:-JackA1ltman/NonGKI_Kernel_Patches}"
 PATCHES_BRANCH="${PATCHES_BRANCH:-op_kernel}"
@@ -80,8 +81,8 @@ setup_kernelsu() {
 
     case "$KERNELSU_VARIANT" in
         ksu)
-            log "Setting up original KernelSU (tiann)..."
-            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+            log "Setting up original KernelSU (tiann, ref: $KERNELSU_REF)..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KERNELSU_REF"
             ;;
         sukisu)
             log "Setting up SukiSU-Ultra..."
@@ -303,6 +304,7 @@ main() {
     log "Branch: $KERNEL_BRANCH"
     log "Defconfig: $DEFCONFIG"
     log "KernelSU Variant: $KERNELSU_VARIANT"
+    log "KernelSU Ref: $KERNELSU_REF"
     log "SUSFS Enabled: $SUSFS_ENABLED"
     log ""
 
