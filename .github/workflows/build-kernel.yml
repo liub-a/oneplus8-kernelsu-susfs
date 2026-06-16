@@ -33,6 +33,11 @@ on:
           - next
           - sukisu
           - rsuntk
+      kernelsu_ref:
+        description: "KernelSU tag/commit used when kernelsu_variant=ksu"
+        required: true
+        default: "v0.9.5"
+        type: string
       susfs_enabled:
         description: "Enable SuSFS patches"
         required: true
@@ -128,6 +133,7 @@ jobs:
           DEFCONFIG: ${{ inputs.defconfig }}
           DEVICE_NAME: ${{ inputs.device_name }}
           KERNELSU_VARIANT: ${{ inputs.kernelsu_variant }}
+          KERNELSU_REF: ${{ inputs.kernelsu_ref }}
           SUSFS_ENABLED: ${{ inputs.susfs_enabled }}
           SUSFS_BRANCH: ${{ inputs.susfs_branch }}
           ALLOW_EXPERIMENTAL_SUSFS_VARIANT: ${{ inputs.allow_experimental_susfs_variant }}
