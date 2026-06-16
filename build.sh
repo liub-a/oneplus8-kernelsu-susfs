@@ -193,6 +193,37 @@ PY
     fi
 }
 
+fix_exec_susfs_header() {
+    local file="fs/exec.c"
+    [ -f "$file" ] || error "Missing $file for exec SUSFS fallback"
+
+    if grep -q "#include <linux/susfs_def.h>" "$file"; then
+        return
+    fi
+
+    python3 - <<'PY'
+from pathlib import Path
+p = Path('fs/exec.c')
+s = p.read_text()
+block = '''#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs_def.h>
+#endif // #ifdef CONFIG_KSU_SUSFS
+'''
+if '#include <linux/susfs_def.h>' not in s:
+    for needle in (
+        '#include <linux/vmalloc.h>\n',
+        '#include <linux/compat.h>\n',
+        '#include <linux/oom.h>\n',
+    ):
+        if needle in s:
+            s = s.replace(needle, needle + block, 1)
+            break
+    else:
+        raise SystemExit('exec.c fallback include anchor not found')
+p.write_text(s)
+PY
+}
+
 apply_patch_file() {
     local patch_file="$1"
     local label
@@ -214,7 +245,7 @@ apply_patch_file() {
     fi
 
     if [ "$label" = "01_add_susfs_hooks.patch" ]; then
-        warn "$label does not apply cleanly; applying compatible hunks and allowing namespace/task_mmu rejects"
+        warn "$label does not apply cleanly; applying compatible hunks and allowing exec/namespace/task_mmu rejects"
         if patch --forward -p1 < "$patch_file"; then
             return
         fi
@@ -222,8 +253,8 @@ apply_patch_file() {
         local unexpected_rejects=0
         while IFS= read -r rej; do
             case "$rej" in
-                ./fs/namespace.c.rej|fs/namespace.c.rej|./fs/proc/task_mmu.c.rej|fs/proc/task_mmu.c.rej)
-                    warn "Allowed reject from split follow-up patch: $rej"
+                ./fs/exec.c.rej|fs/exec.c.rej|./fs/namespace.c.rej|fs/namespace.c.rej|./fs/proc/task_mmu.c.rej|fs/proc/task_mmu.c.rej)
+                    warn "Allowed reject from split follow-up/fallback patch: $rej"
                     ;;
                 *)
                     unexpected_rejects=1
@@ -232,9 +263,10 @@ apply_patch_file() {
         done < <(find . -name "*.rej" -print)
 
         if [ "$unexpected_rejects" = "0" ]; then
+            fix_exec_susfs_header
             fix_namespace_susfs_header
-            rm -f fs/namespace.c.rej fs/proc/task_mmu.c.rej
-            warn "$label partially applied; 04/05 follow-up patches will cover rejected hunks"
+            rm -f fs/exec.c.rej fs/namespace.c.rej fs/proc/task_mmu.c.rej
+            warn "$label partially applied; exec fallback plus 04/05 follow-up patches will cover rejected hunks"
             return
         fi
     fi
