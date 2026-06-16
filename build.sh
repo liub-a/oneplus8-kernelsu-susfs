@@ -30,7 +30,6 @@ log() { echo -e "${GREEN}[BUILD]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
-# Clone kernel source
 clone_kernel() {
     log "Cloning kernel source..."
     if [ -d "kernel_source" ]; then
@@ -42,7 +41,6 @@ clone_kernel() {
     fi
 }
 
-# Clone auxiliary patches repo only when local patches are absent.
 clone_patches() {
     if [ -d "patches" ]; then
         log "Local patches directory exists, skipping external patch clone"
@@ -53,7 +51,6 @@ clone_patches() {
     git clone --depth=1 -b "$PATCHES_BRANCH" "https://github.com/$PATCHES_REPO.git" patches
 }
 
-# Fix vDSO compilation for Clang + GNU assembler
 fix_vdso() {
     log "Fixing vDSO compilation for Clang compatibility..."
     cd kernel_source
@@ -78,7 +75,6 @@ fix_vdso() {
     cd ..
 }
 
-# Setup KernelSU based on variant
 setup_kernelsu() {
     log "Setting up KernelSU (variant: $KERNELSU_VARIANT)..."
     cd kernel_source
@@ -144,8 +140,6 @@ apply_ksu_susfs_patch() {
         return
     fi
 
-    # KernelSU v0.9.5 usually only conflicts on the final selinux.c hunk.
-    # The local helper intentionally patches that exact missing SUSFS SELinux function block.
     local reject_count
     reject_count=$(find . -name "*.rej" | wc -l | tr -d ' ')
     if [ "$reject_count" = "1" ] && [ -f "kernel/selinux/selinux.c.rej" ] && [ -f "../../add_susfs_functions.sh" ]; then
@@ -159,6 +153,44 @@ apply_ksu_susfs_patch() {
     warn "KernelSU SUSFS patch failed with rejects:"
     find . -name "*.rej" -print -exec cat {} \;
     error "Failed to apply KernelSU SUSFS patch"
+}
+
+fix_namespace_susfs_header() {
+    local file="fs/namespace.c"
+    [ -f "$file" ] || error "Missing $file for namespace SUSFS fallback"
+
+    if ! grep -q "#include <linux/susfs_def.h>" "$file"; then
+        if grep -q "#include <linux/fs_context.h>" "$file"; then
+            sed -i '/#include <linux\/fs_context.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT' "$file"
+        else
+            sed -i '/#include <linux\/sched\/task.h>/a #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n#include <linux/susfs_def.h>\n#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT' "$file"
+        fi
+    fi
+
+    if ! grep -q "static DEFINE_IDA(susfs_ksu_mnt_group_ida);" "$file"; then
+        python3 - <<'PY'
+from pathlib import Path
+p = Path('fs/namespace.c')
+s = p.read_text()
+block = '''#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern bool susfs_is_boot_completed_triggered;
+
+static DEFINE_IDA(susfs_ksu_mnt_group_ida);
+static atomic64_t susfs_ksu_mounts = ATOMIC64_INIT(0);
+
+#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+
+'''
+needle = '/* Maximum number of mounts in a mount namespace */\n'
+if block not in s:
+    if needle not in s:
+        raise SystemExit('namespace.c fallback anchor not found')
+    s = s.replace(needle, block + needle, 1)
+p.write_text(s)
+PY
+    fi
 }
 
 apply_patch_file() {
@@ -181,8 +213,35 @@ apply_patch_file() {
         return
     fi
 
+    if [ "$label" = "01_add_susfs_hooks.patch" ]; then
+        warn "$label does not apply cleanly; applying compatible hunks and allowing namespace/task_mmu rejects"
+        if patch --forward -p1 < "$patch_file"; then
+            return
+        fi
+
+        local unexpected_rejects=0
+        while IFS= read -r rej; do
+            case "$rej" in
+                ./fs/namespace.c.rej|fs/namespace.c.rej|./fs/proc/task_mmu.c.rej|fs/proc/task_mmu.c.rej)
+                    warn "Allowed reject from split follow-up patch: $rej"
+                    ;;
+                *)
+                    unexpected_rejects=1
+                    ;;
+            esac
+        done < <(find . -name "*.rej" -print)
+
+        if [ "$unexpected_rejects" = "0" ]; then
+            fix_namespace_susfs_header
+            rm -f fs/namespace.c.rej fs/proc/task_mmu.c.rej
+            warn "$label partially applied; 04/05 follow-up patches will cover rejected hunks"
+            return
+        fi
+    fi
+
     warn "Dry-run failed for $label:"
     cat /tmp/susfs_patch_check.log || true
+    find . -name "*.rej" -print -exec cat {} \; || true
     error "Failed to apply local SUSFS kernel patch: $label"
 }
 
@@ -197,7 +256,6 @@ apply_local_susfs_kernel_files() {
     cp -v "$SUSFS_LOCAL_SOURCE_DIR/susfs.h" include/linux/susfs.h || error "Failed to copy susfs.h"
     cp -v "$SUSFS_LOCAL_SOURCE_DIR/susfs_def.h" include/linux/susfs_def.h || error "Failed to copy susfs_def.h"
 
-    # 00_add_susfs_source.patch creates fs/susfs.c; source is copied above, so skip it.
     for patch_file in \
         "$SUSFS_LOCAL_PATCH_DIR/01_add_susfs_hooks.patch" \
         "$SUSFS_LOCAL_PATCH_DIR/02_add_susfs_misc.patch" \
@@ -224,7 +282,6 @@ apply_upstream_susfs_kernel_files() {
     patch -p1 < 50_add_susfs_in_kernel-4.19.patch || error "Failed to apply kernel SUSFS patch"
 }
 
-# Apply SUSFS patches
 apply_susfs() {
     if [ "$SUSFS_ENABLED" != "true" ]; then
         log "SUSFS disabled, skipping..."
@@ -270,7 +327,6 @@ apply_susfs() {
     cd ..
 }
 
-# Apply VFS hook patches
 apply_vfs_patches() {
     log "Applying VFS hook patches..."
     cd kernel_source
@@ -280,7 +336,6 @@ apply_vfs_patches() {
     cd ..
 }
 
-# Configure kernel
 configure_kernel() {
     log "Configuring kernel..."
     cd kernel_source
@@ -312,7 +367,6 @@ configure_kernel() {
     cd ..
 }
 
-# Build kernel
 build_kernel() {
     log "Building kernel..."
     cd kernel_source
@@ -335,7 +389,6 @@ build_kernel() {
     cd ..
 }
 
-# Check build result
 check_build() {
     cd kernel_source
     if [ ! -f "out/arch/arm64/boot/Image" ]; then
@@ -346,7 +399,6 @@ check_build() {
     cd ..
 }
 
-# Package kernel with AnyKernel3
 package_kernel() {
     log "Packaging kernel..."
     cd kernel_source
@@ -357,7 +409,6 @@ package_kernel() {
 
     cd AnyKernel3
     rm -rf .git modules patch ramdisk
-
     cp ../out/arch/arm64/boot/Image .
     [ -f "../out/arch/arm64/boot/dtb" ] && cp ../out/arch/arm64/boot/dtb .
     [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
