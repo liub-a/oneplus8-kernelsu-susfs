@@ -13,7 +13,12 @@ SUSFS_ENABLED="${SUSFS_ENABLED:-true}"
 PATCHES_REPO="${PATCHES_REPO:-JackA1ltman/NonGKI_Kernel_Patches}"
 PATCHES_BRANCH="${PATCHES_BRANCH:-op_kernel}"
 SUSFS_BRANCH="${SUSFS_BRANCH:-kernel-4.19}"
+SUSFS_USE_LOCAL="${SUSFS_USE_LOCAL:-true}"
 ALLOW_EXPERIMENTAL_SUSFS_VARIANT="${ALLOW_EXPERIMENTAL_SUSFS_VARIANT:-false}"
+
+# Paths are evaluated from inside kernel_source when applying SUSFS.
+SUSFS_LOCAL_PATCH_DIR="${SUSFS_LOCAL_PATCH_DIR:-../susfs-patches}"
+SUSFS_LOCAL_SOURCE_DIR="${SUSFS_LOCAL_SOURCE_DIR:-../susfs-v2}"
 
 # Colors
 RED='\033[0;31m'
@@ -37,12 +42,15 @@ clone_kernel() {
     fi
 }
 
-# Clone patches repo
+# Clone auxiliary patches repo only when local patches are absent.
 clone_patches() {
-    log "Cloning patches repo..."
-    if [ ! -d "patches" ]; then
-        git clone --depth=1 -b "$PATCHES_BRANCH" "https://github.com/$PATCHES_REPO.git" patches
+    if [ -d "patches" ]; then
+        log "Local patches directory exists, skipping external patch clone"
+        return
     fi
+
+    log "Cloning patches repo..."
+    git clone --depth=1 -b "$PATCHES_BRANCH" "https://github.com/$PATCHES_REPO.git" patches
 }
 
 # Fix vDSO compilation for Clang + GNU assembler
@@ -50,9 +58,6 @@ fix_vdso() {
     log "Fixing vDSO compilation for Clang compatibility..."
     cd kernel_source
 
-    # Fix vDSO compilation error with Clang + GNU assembler
-    # The issue is Clang generates DWARF debug info (.file directives) that GNU as doesn't understand
-    # Solution: Disable debug info generation for vDSO with -g0
     VDSO_MAKEFILE="arch/arm64/kernel/vdso/Makefile"
     if [ -f "$VDSO_MAKEFILE" ]; then
         log "Patching vDSO Makefile..."
@@ -62,7 +67,6 @@ fix_vdso() {
         log "vDSO Makefile patched"
     fi
 
-    # Also patch vdso32 if it exists
     VDSO32_MAKEFILE="arch/arm64/kernel/vdso32/Makefile"
     if [ -f "$VDSO32_MAKEFILE" ]; then
         log "Patching vDSO32 Makefile..."
@@ -104,7 +108,123 @@ setup_kernelsu() {
     cd ..
 }
 
-# Apply SUSFS patches following official instructions
+ensure_susfs4ksu_repo() {
+    if [ -d "susfs4ksu" ]; then
+        return
+    fi
+
+    log "Cloning susfs4ksu ($SUSFS_BRANCH branch) for KernelSU integration patch..."
+    git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" susfs4ksu || \
+    git clone --depth=1 https://github.com/sidex15/susfs4ksu.git -b "$SUSFS_BRANCH" susfs4ksu
+}
+
+apply_ksu_susfs_patch() {
+    local ksu_dir="$1"
+    local ksu_patch=""
+
+    if [ -f "../susfs-patches/10_enable_susfs_for_ksu.patch" ]; then
+        ksu_patch="../susfs-patches/10_enable_susfs_for_ksu.patch"
+    elif [ -f "../patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+        ksu_patch="../patches/KernelSU/10_enable_susfs_for_ksu.patch"
+    else
+        ensure_susfs4ksu_repo
+        ksu_patch="susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+    fi
+
+    [ -f "$ksu_patch" ] || error "Missing KernelSU SUSFS patch: $ksu_patch"
+
+    log "Step 3: Applying KernelSU SUSFS patch: $ksu_patch"
+    cp "$ksu_patch" "$ksu_dir/10_enable_susfs_for_ksu.patch"
+
+    cd "$ksu_dir"
+    find . -name "*.rej" -delete
+
+    if patch -p1 < 10_enable_susfs_for_ksu.patch; then
+        cd ..
+        return
+    fi
+
+    # KernelSU v0.9.5 usually only conflicts on the final selinux.c hunk.
+    # The local helper intentionally patches that exact missing SUSFS SELinux function block.
+    local reject_count
+    reject_count=$(find . -name "*.rej" | wc -l | tr -d ' ')
+    if [ "$reject_count" = "1" ] && [ -f "kernel/selinux/selinux.c.rej" ] && [ -f "../../add_susfs_functions.sh" ]; then
+        warn "KernelSU SUSFS patch left only kernel/selinux/selinux.c.rej; applying local fallback"
+        bash ../../add_susfs_functions.sh kernel/selinux/selinux.c || error "Failed to apply selinux.c SUSFS fallback"
+        rm -f kernel/selinux/selinux.c.rej
+        cd ..
+        return
+    fi
+
+    warn "KernelSU SUSFS patch failed with rejects:"
+    find . -name "*.rej" -print -exec cat {} \;
+    error "Failed to apply KernelSU SUSFS patch"
+}
+
+apply_patch_file() {
+    local patch_file="$1"
+    local label
+    label=$(basename "$patch_file")
+
+    [ -f "$patch_file" ] || error "Missing patch: $patch_file"
+    log "Applying local SUSFS kernel patch: $label"
+
+    find . -name "*.rej" -delete
+
+    if patch --forward --dry-run -p1 < "$patch_file" >/tmp/susfs_patch_check.log 2>&1; then
+        patch --forward -p1 < "$patch_file" || error "Failed to apply $label"
+        return
+    fi
+
+    if patch --reverse --dry-run -p1 < "$patch_file" >/tmp/susfs_patch_reverse_check.log 2>&1; then
+        warn "$label appears to be already applied, skipping"
+        return
+    fi
+
+    warn "Dry-run failed for $label:"
+    cat /tmp/susfs_patch_check.log || true
+    error "Failed to apply local SUSFS kernel patch: $label"
+}
+
+apply_local_susfs_kernel_files() {
+    [ -d "$SUSFS_LOCAL_SOURCE_DIR" ] || error "Local SUSFS source directory not found: $SUSFS_LOCAL_SOURCE_DIR"
+    [ -d "$SUSFS_LOCAL_PATCH_DIR" ] || error "Local SUSFS patch directory not found: $SUSFS_LOCAL_PATCH_DIR"
+
+    log "Using local SUSFS source: $SUSFS_LOCAL_SOURCE_DIR"
+    log "Using local SUSFS patches: $SUSFS_LOCAL_PATCH_DIR"
+
+    cp -v "$SUSFS_LOCAL_SOURCE_DIR/susfs.c" fs/susfs.c || error "Failed to copy susfs.c"
+    cp -v "$SUSFS_LOCAL_SOURCE_DIR/susfs.h" include/linux/susfs.h || error "Failed to copy susfs.h"
+    cp -v "$SUSFS_LOCAL_SOURCE_DIR/susfs_def.h" include/linux/susfs_def.h || error "Failed to copy susfs_def.h"
+
+    # 00_add_susfs_source.patch creates fs/susfs.c; source is copied above, so skip it.
+    for patch_file in \
+        "$SUSFS_LOCAL_PATCH_DIR/01_add_susfs_hooks.patch" \
+        "$SUSFS_LOCAL_PATCH_DIR/02_add_susfs_misc.patch" \
+        "$SUSFS_LOCAL_PATCH_DIR/03_fix_exec.patch" \
+        "$SUSFS_LOCAL_PATCH_DIR/04_fix_namespace_clone_mnt.patch" \
+        "$SUSFS_LOCAL_PATCH_DIR/05_fix_task_mmu.patch"; do
+        if [ -f "$patch_file" ]; then
+            apply_patch_file "$patch_file"
+        else
+            warn "Optional local SUSFS patch missing: $patch_file"
+        fi
+    done
+}
+
+apply_upstream_susfs_kernel_files() {
+    ensure_susfs4ksu_repo
+
+    log "Copying upstream SUSFS source files..."
+    cp -v susfs4ksu/kernel_patches/fs/* fs/ || error "Failed to copy SUSFS fs source files"
+    cp -v susfs4ksu/kernel_patches/include/linux/* include/linux/ || error "Failed to copy SUSFS include files"
+
+    log "Applying upstream kernel SUSFS patch..."
+    cp susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch ./ || error "Missing 50_add_susfs_in_kernel-4.19.patch"
+    patch -p1 < 50_add_susfs_in_kernel-4.19.patch || error "Failed to apply kernel SUSFS patch"
+}
+
+# Apply SUSFS patches
 apply_susfs() {
     if [ "$SUSFS_ENABLED" != "true" ]; then
         log "SUSFS disabled, skipping..."
@@ -118,54 +238,33 @@ apply_susfs() {
     log "Applying SUSFS patches..."
     cd kernel_source
 
-    # Find KernelSU directory
     KSU_DIR=$(find . -maxdepth 1 -type d -name "KernelSU*" | head -1)
     [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ] || error "KernelSU directory not found after setup_kernelsu"
     log "KernelSU directory: $KSU_DIR"
 
-    # Clone susfs4ksu for kernel patches (kernel-4.19 branch by default)
-    log "Cloning susfs4ksu ($SUSFS_BRANCH branch)..."
-    git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH" susfs4ksu || \
-    git clone --depth=1 https://github.com/sidex15/susfs4ksu.git -b "$SUSFS_BRANCH" susfs4ksu
-
-    # Step 1: Apply revert commit in KernelSU (as per official instructions)
     log "Step 1: Reverting kprobe commit in KernelSU..."
     cd "$KSU_DIR"
     git revert --no-commit 898e9d4f8ca9b2f46b0c6b36b80a872b5b88d899 2>/dev/null || log "Revert may not be needed for this version"
     cd ..
 
-    # Step 2: Disable kprobes in KernelSU (replace #ifdef CONFIG_KPROBES with #if defined(CONFIG_KPROBES) && 0)
     log "Step 2: Disabling kprobes in KernelSU..."
     find "$KSU_DIR" \( -name "*.c" -o -name "*.h" \) -print0 | \
         xargs -0 sed -i 's/#ifdef CONFIG_KPROBES/#if defined(CONFIG_KPROBES) \&\& 0/g'
     find "$KSU_DIR" \( -name "*.c" -o -name "*.h" \) -print0 | \
         xargs -0 sed -i 's/#if defined(CONFIG_KPROBES)/#if defined(CONFIG_KPROBES) \&\& 0/g'
 
-    # Step 3: Copy SUSFS patch to KernelSU folder and apply
-    log "Step 3: Copying and applying SUSFS KernelSU patch..."
-    if [ -f "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
-        cp susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$KSU_DIR/"
-        cd "$KSU_DIR"
-        patch -p1 < 10_enable_susfs_for_ksu.patch || error "Failed to apply KernelSU SUSFS patch"
-        cd ..
+    apply_ksu_susfs_patch "$KSU_DIR"
+
+    if [ "$SUSFS_USE_LOCAL" = "true" ] && [ -d "$SUSFS_LOCAL_SOURCE_DIR" ] && [ -d "$SUSFS_LOCAL_PATCH_DIR" ]; then
+        apply_local_susfs_kernel_files
     else
-        error "Missing susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+        warn "Local SUSFS files unavailable or disabled; falling back to upstream susfs4ksu"
+        apply_upstream_susfs_kernel_files
     fi
 
-    # Step 4: Copy SUSFS source files to kernel
-    log "Step 4: Copying SUSFS source files..."
-    cp -v susfs4ksu/kernel_patches/fs/* fs/ || error "Failed to copy SUSFS fs source files"
-    cp -v susfs4ksu/kernel_patches/include/linux/* include/linux/ || error "Failed to copy SUSFS include files"
-
-    # Step 5: Copy and apply kernel SUSFS patch
-    log "Step 5: Applying kernel SUSFS patch..."
-    cp susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch ./ || error "Missing 50_add_susfs_in_kernel-4.19.patch"
-    patch -p1 < 50_add_susfs_in_kernel-4.19.patch || error "Failed to apply kernel SUSFS patch"
-
-    # Step 6: Apply device-specific fixes if available
     if [ -f "../patches/kona_cos15_a15/susfs_fixed.patch" ]; then
-        log "Step 6: Applying device-specific SUSFS fixes..."
-        patch -p1 < ../patches/kona_cos15_a15/susfs_fixed.patch || log "Device patch may already be applied"
+        log "Applying device-specific SUSFS fixes..."
+        patch -p1 < ../patches/kona_cos15_a15/susfs_fixed.patch || warn "Device patch may already be applied"
     fi
 
     cd ..
@@ -176,7 +275,7 @@ apply_vfs_patches() {
     log "Applying VFS hook patches..."
     cd kernel_source
     if [ -f "../patches/vfs_hook_patches.sh" ]; then
-        bash ../patches/vfs_hook_patches.sh || log "VFS patches may already be applied"
+        bash ../patches/vfs_hook_patches.sh || warn "VFS patches may already be applied"
     fi
     cd ..
 }
@@ -192,10 +291,8 @@ configure_kernel() {
         CROSS_COMPILE_ARM32=arm-linux-androideabi- \
         "$DEFCONFIG"
 
-    # Enable KernelSU
     ./scripts/config --file out/.config -e KSU
 
-    # Enable SUSFS if enabled
     if [ "$SUSFS_ENABLED" = "true" ]; then
         ./scripts/config --file out/.config -e KSU_SUSFS || true
         ./scripts/config --file out/.config -e KSU_SUSFS_SUS_PATH || true
@@ -205,9 +302,11 @@ configure_kernel() {
         ./scripts/config --file out/.config -e KSU_SUSFS_SPOOF_UNAME || true
         ./scripts/config --file out/.config -e KSU_SUSFS_ENABLE_LOG || true
         ./scripts/config --file out/.config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS || true
+        ./scripts/config --file out/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG || true
+        ./scripts/config --file out/.config -e KSU_SUSFS_OPEN_REDIRECT || true
+        ./scripts/config --file out/.config -e KSU_SUSFS_SUS_MAP || true
     fi
 
-    # Regenerate config
     make O=out ARCH=arm64 olddefconfig
 
     cd ..
@@ -218,11 +317,8 @@ build_kernel() {
     log "Building kernel..."
     cd kernel_source
 
-    # Get CPU count
     CPUS=$(nproc --all)
 
-    # Use 'yes ""' to auto-accept default for any config prompts
-    # LLVM_IAS=1 to use Clang's integrated assembler (handles DWARF debug info properly)
     yes "" | make -j"$CPUS" O=out ARCH=arm64 CC=clang \
         CLANG_TRIPLE=aarch64-linux-gnu- \
         CROSS_COMPILE=aarch64-linux-android- \
@@ -255,25 +351,17 @@ package_kernel() {
     log "Packaging kernel..."
     cd kernel_source
 
-    # Clone AnyKernel3
     if [ ! -d "AnyKernel3" ]; then
         git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git
     fi
 
-    # Clean and prepare AnyKernel3
     cd AnyKernel3
     rm -rf .git modules patch ramdisk
 
-    # Copy kernel image
     cp ../out/arch/arm64/boot/Image .
-
-    # Copy DTB if exists
     [ -f "../out/arch/arm64/boot/dtb" ] && cp ../out/arch/arm64/boot/dtb .
-
-    # Copy DTBO if exists
     [ -f "../out/arch/arm64/boot/dtbo.img" ] && cp ../out/arch/arm64/boot/dtbo.img .
 
-    # Configure anykernel.sh for OnePlus SM8250 family
     sed -i "s/do.devicecheck=.*/do.devicecheck=1/g" anykernel.sh
     sed -i "s/do.modules=.*/do.modules=0/g" anykernel.sh
     sed -i "s/device.name1=.*/device.name1=instantnoodle/g" anykernel.sh
@@ -283,21 +371,18 @@ package_kernel() {
     sed -i "s|block=.*|block=/dev/block/bootdevice/by-name/boot;|g" anykernel.sh
     sed -i "s/is_slot_device=.*/is_slot_device=1;/g" anykernel.sh
 
-    # Create flashable zip
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     SUSFS_TAG=""
     [ "$SUSFS_ENABLED" = "true" ] && SUSFS_TAG="_SUSFS"
     ZIP_NAME="KernelSU-${KERNELSU_VARIANT}${SUSFS_TAG}_${DEVICE_NAME}_${TIMESTAMP}.zip"
-    zip -r9 "/output/$ZIP_NAME" * -x .git README.md *placeholder
+    zip -r9 "/output/$ZIP_NAME" * -x .git README.md '*placeholder*'
 
     log "Created: /output/$ZIP_NAME"
     cd ../..
 
-    # Copy kernel image to output
     cp kernel_source/out/arch/arm64/boot/Image /output/ 2>/dev/null || true
 }
 
-# Main
 main() {
     log "=== OnePlus SM8250 Kernel Build with KernelSU + SUSFS ==="
     log "Kernel Source: $KERNEL_SOURCE"
@@ -306,6 +391,7 @@ main() {
     log "KernelSU Variant: $KERNELSU_VARIANT"
     log "KernelSU Ref: $KERNELSU_REF"
     log "SUSFS Enabled: $SUSFS_ENABLED"
+    log "SUSFS Use Local: $SUSFS_USE_LOCAL"
     log ""
 
     clone_kernel
